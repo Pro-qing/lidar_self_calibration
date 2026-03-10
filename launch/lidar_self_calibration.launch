@@ -17,13 +17,15 @@
         <param name="test_rotate_roll" type="double" value="0.0" />
 
         <!-- 车间墙面的实际距离（必须根据实际车间测量设置） -->
-        <param name="actual_left_distance" type="double" value="0.738" />
-        <param name="actual_right_distance" type="double" value="0.658" />
+        <param name="actual_left_distance" type="double" value="1.638" />
+        <param name="actual_right_distance" type="double" value="1.558" />
         <param name="actual_front_distance" type="double" value="2.22" />
                 
         <!-- 手动测量的雷达高度（必须根据实际车间测量设置）-->
         <param name="manual_lidar_height" type="double" value="0.0" />
         
         <!-- 注意：现在订阅的是 /points_16，16线的激光雷达数据 -->
+        <!-- 保存路径 -->
+        <param name="save_path" value="/home/getq/laser_self_calibration_workspace/src/lidar_self_calibration/param/lidar_calibration.yaml" />
     </node>
 </launch>

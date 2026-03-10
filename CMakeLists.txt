@@ -44,6 +44,14 @@ target_link_libraries(lidar_self_calibration
   ${PCL_LIBRARIES}
 )
 
+find_package(yaml-cpp REQUIRED)
+
+# 在 add_executable 之后的 target_link_libraries 中加入：
+target_link_libraries(lidar_self_calibration
+  ${catkin_LIBRARIES}
+  yaml-cpp
+)
+
 
 #############
 ## Install ##

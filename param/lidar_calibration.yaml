@@ -1,0 +1,9 @@
+lidar_calibration:
+  x: 1.080002
+  y: 0.4332519
+  z: 0
+  yaw: -0.2166277
+  pitch: 0
+  roll: 0
+  frame_id: base_link
+  child_frame_id: velodyne

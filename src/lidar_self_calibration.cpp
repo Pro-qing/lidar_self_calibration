@@ -8,6 +8,8 @@
 #include <clocale>
 #include <cmath>
 #include <iomanip>
+#include <fstream>
+#include <yaml-cpp/yaml.h>
 
 // 构造函数
 LidarCalibration::LidarCalibration(ros::NodeHandle& nh) : nh_(nh)
@@ -18,6 +20,9 @@ LidarCalibration::LidarCalibration(ros::NodeHandle& nh) : nh_(nh)
     nh_.param<std::string>("lidar_frame", lidar_frame_, "velodyne");
     nh_.param<std::string>("base_frame", base_frame_, "base_link");
     
+    // 读取保存路径
+    nh_.param<std::string>("save_path", save_path_, "");
+
     // =================================================================================
     // [用户配置区域] 请确保这里的值（或Launch文件中的值）与实际手动测量一致
     // 单位：米
@@ -60,9 +65,7 @@ void LidarCalibration::pointCloudCallback(const sensor_msgs::PointCloud2::ConstP
     
     if (cloud->empty()) return;
 
-    // --- 步骤 1: Z轴直通滤波 (关键) ---
-    // 作用：剔除地面和天花板，防止干扰RANSAC直线拟合
-    // 范围：-1.5m 到 +1.5m (根据雷达安装高度可微调)
+    // --- 步骤 1: Z轴直通滤波 ---
     pcl::PointCloud<pcl::PointXYZ>::Ptr z_filtered_cloud(new pcl::PointCloud<pcl::PointXYZ>);
     pcl::PassThrough<pcl::PointXYZ> pass;
     pass.setInputCloud(cloud);
@@ -80,22 +83,18 @@ void LidarCalibration::pointCloudCallback(const sensor_msgs::PointCloud2::ConstP
     bool detection_success = detectThreeLines(z_filtered_cloud);
     
     if (detection_success) {
-        // 可视化提取出的墙面点
         publishWallPoints();
         
         // --- 步骤 3: 标定计算 ---
-        calculateCalibrationStep(); // 计算瞬时值
-        accumulateAndSmooth();      // 滑动窗口平滑
+        calculateCalibrationStep(); 
+        accumulateAndSmooth();      
         
-        // 发布状态
         publishStatus();
         
-        // 如果计算完成，发布TF和最终点云
         if (calibration_done_) {
             publishTF();
-            publishCalibratedCloud(z_filtered_cloud); // 使用Z过滤后的点云验证对齐效果
+            publishCalibratedCloud(z_filtered_cloud); 
             
-            // 降低打印频率，避免刷屏
             if (total_frames_ % 50 == 0) {
                 printCalibrationResults();
             }
@@ -103,38 +102,31 @@ void LidarCalibration::pointCloudCallback(const sensor_msgs::PointCloud2::ConstP
     } 
 }
 
-// PCA 精修算法：计算点云簇的最优拟合平面(直线)法向量
+// PCA 精修算法
 Eigen::Vector3f LidarCalibration::refineLineParametersPCA(
     const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud, 
     const std::vector<int>& indices) 
 {
     if (indices.size() < 5) return Eigen::Vector3f::Zero();
 
-    // 1. 计算质心
     Eigen::Vector4f centroid;
     pcl::compute3DCentroid(*cloud, indices, centroid);
 
-    // 2. 计算协方差矩阵
     Eigen::Matrix3f covariance_matrix;
     pcl::computeCovarianceMatrix(*cloud, indices, centroid, covariance_matrix);
 
-    // 3. 特征值分解
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> eigen_solver(covariance_matrix, Eigen::ComputeEigenvectors);
     
-    // 最小特征值对应的特征向量即为法向量
     Eigen::Vector3f normal = eigen_solver.eigenvectors().col(0);
     
-    // 强制法向量在水平面 (假设雷达大致水平安装)
     normal.z() = 0.0f;
     normal.normalize();
 
-    // 统一法向量方向：指向原点
     Eigen::Vector3f centroid_vec = centroid.head<3>();
     if (normal.dot(centroid_vec) > 0) {
         normal = -normal;
     }
 
-    // 计算原点到直线的垂直距离
     float distance = std::abs(normal.dot(centroid_vec));
     return Eigen::Vector3f(normal.x(), normal.y(), distance);
 }
@@ -158,14 +150,13 @@ bool LidarCalibration::detectThreeLines(const pcl::PointCloud<pcl::PointXYZ>::Pt
         return false;
     }
     
-    // 提取结果到成员变量
     for (const auto& wall : detected_walls) {
         LaserLine line;
         line.label = wall.label;
         line.point_count = wall.point_count;
         line.raw_points = wall.points;
-        line.avg_distance = wall.avg_distance; // PCA 精度距离
-        line.normal = wall.pca_normal;         // PCA 精度法向量
+        line.avg_distance = wall.avg_distance; 
+        line.normal = wall.pca_normal;         
         line.angle_center = std::atan2(wall.pca_normal.y(), wall.pca_normal.x());
         line.confidence = std::min(1.0f, line.point_count / 100.0f);
         
@@ -183,7 +174,6 @@ std::vector<DetectedWall> LidarCalibration::detectWallsWithRANSAC(
 {
     std::vector<DetectedWall> walls;
     
-    // 角度搜索区域（角度范围较大以防止盲区）
     struct WallRegion { std::string label; float min_angle_deg; float max_angle_deg; };
     std::vector<WallRegion> wall_regions = {
         {"front", -50.0f, 50.0f},
@@ -197,13 +187,12 @@ std::vector<DetectedWall> LidarCalibration::detectWallsWithRANSAC(
         float min_rad = toRadians(region.min_angle_deg);
         float max_rad = toRadians(region.max_angle_deg);
         
-        // 1. 区域滤波
         for (const auto& point : cloud->points) {
             float r = std::sqrt(point.x*point.x + point.y*point.y);
-            if(r < 1.0f || r > 15.0f) continue; // 距离过滤
+            if(r < 1.0f || r > 15.0f) continue; 
 
             float angle = std::atan2(point.y, point.x);
-            if (region.label == "right" && angle > 0) angle -= 2.0f * M_PI; // 处理 -PI/+PI 跳变
+            if (region.label == "right" && angle > 0) angle -= 2.0f * M_PI; 
             
             if (angle >= min_rad && angle <= max_rad) {
                 region_cloud->push_back(point);
@@ -212,7 +201,6 @@ std::vector<DetectedWall> LidarCalibration::detectWallsWithRANSAC(
         
         if (region_cloud->size() < 30) continue;
         
-        // 2. RANSAC 拟合直线
         pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
         pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
         
@@ -220,19 +208,17 @@ std::vector<DetectedWall> LidarCalibration::detectWallsWithRANSAC(
         seg.setOptimizeCoefficients(true);
         seg.setModelType(pcl::SACMODEL_LINE);
         seg.setMethodType(pcl::SAC_RANSAC);
-        seg.setDistanceThreshold(0.10); // 10cm 宽阈值，确保能抓到墙
+        seg.setDistanceThreshold(0.10); 
         seg.setMaxIterations(1000);
         seg.setInputCloud(region_cloud);
         seg.segment(*inliers, *coefficients);
         
         if (inliers->indices.size() < 20) continue;
         
-        // 3. PCA 精确计算参数
         Eigen::Vector3f pca_result = refineLineParametersPCA(region_cloud, inliers->indices);
         Eigen::Vector3f normal(pca_result.x(), pca_result.y(), 0.0f);
         float distance = pca_result.z();
         
-        // 4. 保存内点
         std::vector<pcl::PointXYZ> wall_points;
         for (int idx : inliers->indices) {
             wall_points.push_back(region_cloud->points[idx]);
@@ -255,9 +241,6 @@ void LidarCalibration::calculateCalibrationStep()
 {
     if (left_line_.point_count == 0 || right_line_.point_count == 0 || front_line_.point_count == 0) return;
 
-    // --- 1. 计算 Yaw (基于法向量对齐) ---
-    // 理论上: Front墙法向量应指向X负轴(180度), Left指向Y负轴(-90度), Right指向Y正轴(90度)
-    // Yaw = 理论角度 - 测量角度
     float meas_yaw_front = front_line_.angle_center;
     float meas_yaw_left  = left_line_.angle_center;
     float meas_yaw_right = right_line_.angle_center;
@@ -266,7 +249,6 @@ void LidarCalibration::calculateCalibrationStep()
     float yaw_est_left  = normalizeAngleRad(-M_PI/2.0f - meas_yaw_left);
     float yaw_est_right = normalizeAngleRad(M_PI/2.0f - meas_yaw_right);
 
-    // 向量加权平均
     float w_f = front_line_.confidence;
     float w_l = left_line_.confidence;
     float w_r = right_line_.confidence;
@@ -275,16 +257,11 @@ void LidarCalibration::calculateCalibrationStep()
     float sum_cos = w_f*cos(yaw_est_front) + w_l*cos(yaw_est_left) + w_r*cos(yaw_est_right);
     float avg_yaw = std::atan2(sum_sin, sum_cos);
 
-    // --- 2. 计算 Translation (修正Yaw后) ---
-    // X轴平移由前墙决定
     float tx = actual_front_dist_ - front_line_.avg_distance;
-    
-    // Y轴平移由左右墙加权平均决定
     float ty_from_left  = actual_left_dist_ - left_line_.avg_distance;
     float ty_from_right = right_line_.avg_distance - actual_right_dist_;
     float ty = (ty_from_left * w_l + ty_from_right * w_r) / (w_l + w_r);
 
-    // 更新瞬时变换矩阵
     transform_matrix_.setIdentity();
     Eigen::Matrix3f R;
     R = Eigen::AngleAxisf(avg_yaw, Eigen::Vector3f::UnitZ());
@@ -301,12 +278,10 @@ void LidarCalibration::accumulateAndSmooth()
 {
     float current_yaw = std::atan2(transform_matrix_(1,0), transform_matrix_(0,0));
     
-    // 检查一致性（用于诊断）
     float ty_left_check  = actual_left_dist_ - left_line_.avg_distance;
     float ty_right_check = right_line_.avg_distance - actual_right_dist_;
     float right_error = std::abs(ty_left_check - ty_right_check);
 
-    // 房间宽度不匹配警告 (仅在误差较大时提示)
     if (right_error > 0.15f) { 
         float config_width = actual_left_dist_ + actual_right_dist_;
         float meas_width = left_line_.avg_distance + right_line_.avg_distance;
@@ -314,7 +289,6 @@ void LidarCalibration::accumulateAndSmooth()
             config_width, meas_width, std::abs(config_width - meas_width));
     }
 
-    // 加入队列
     CalibrationResult res;
     res.transform = transform_matrix_;
     res.yaw = current_yaw;
@@ -323,19 +297,22 @@ void LidarCalibration::accumulateAndSmooth()
 
     calibration_queue_.push_back(res);
     
-    // 保持队列长度约 50 帧 (10Hz下约5秒)
     if (calibration_queue_.size() > 50) {
         calibration_queue_.pop_front();
     }
     
-    // 计算平滑后的结果
     computeRobustAverage();
+
+    // 自动写入逻辑
+    if (calibration_queue_.size() >= 50 && total_frames_ % 100 == 0) {
+        saveResultsToYaml();
+    }
 }
 
 // 鲁棒平均计算
 void LidarCalibration::computeRobustAverage()
 {
-    if (calibration_queue_.size() < 10) return; // 初始数据积累
+    if (calibration_queue_.size() < 10) return; 
 
     double sum_sin = 0, sum_cos = 0;
     double sum_x = 0, sum_y = 0;
@@ -353,7 +330,6 @@ void LidarCalibration::computeRobustAverage()
     float final_x = sum_x / count;
     float final_y = sum_y / count;
 
-    // 用平滑后的值覆盖
     transform_matrix_.setIdentity();
     Eigen::Matrix3f R;
     R = Eigen::AngleAxisf(final_yaw, Eigen::Vector3f::UnitZ());
@@ -361,6 +337,35 @@ void LidarCalibration::computeRobustAverage()
     transform_matrix_(0,3) = final_x;
     transform_matrix_(1,3) = final_y;
     transform_matrix_(2,3) = manual_lidar_height_;
+}
+
+// 自动写入 YAML 文件
+void LidarCalibration::saveResultsToYaml()
+{
+    if (save_path_.empty()) return;
+
+    try {
+        YAML::Node config;
+        float x = transform_matrix_(0, 3);
+        float y = transform_matrix_(1, 3);
+        float z = transform_matrix_(2, 3);
+        float yaw = std::atan2(transform_matrix_(1, 0), transform_matrix_(0, 0));
+
+        config["lidar_calibration"]["x"] = x;
+        config["lidar_calibration"]["y"] = y;
+        config["lidar_calibration"]["z"] = z;
+        config["lidar_calibration"]["yaw"] = yaw;
+        config["lidar_calibration"]["pitch"] = 0.0;
+        config["lidar_calibration"]["roll"] = 0.0;
+        config["lidar_calibration"]["frame_id"] = base_frame_;
+        config["lidar_calibration"]["child_frame_id"] = lidar_frame_;
+
+        std::ofstream fout(save_path_);
+        fout << config;
+        fout.close();
+    } catch (const std::exception& e) {
+        ROS_ERROR("Failed to write YAML: %s", e.what());
+    }
 }
 
 // --- 辅助工具函数 ---
@@ -413,11 +418,8 @@ void LidarCalibration::printCalibrationResults()
     float yaw = std::atan2(transform_matrix_(1, 0), transform_matrix_(0, 0));
     
     ROS_INFO("================ 标定输出 (稳定帧数: %lu) ================", calibration_queue_.size());
-    
-    // 不再调用 toDegrees(yaw)，单位显示改为 rad
     ROS_INFO("Extrinsic TF: x=%.4f m, y=%.4f m, yaw=%.4f rad", x, y, yaw);
     
-    // 实测房间宽度诊断 (用于校正参数)
     float meas_width = left_line_.avg_distance + right_line_.avg_distance;
     ROS_INFO("环境诊断: 实测房间宽度 %.3fm (Left:%.3f + Right:%.3f)", meas_width, left_line_.avg_distance, right_line_.avg_distance);
 }
@@ -465,7 +467,3 @@ float LidarCalibration::toDegrees(float radians) { return radians * 180.0f / M_P
 void LidarCalibration::run() {
     ros::spin();
 }
-
-
-
-
